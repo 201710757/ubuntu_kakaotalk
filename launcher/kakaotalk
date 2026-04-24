@@ -94,21 +94,25 @@ setsid -f bash -c '
             fi
         done
     }
-    # Event stream: fires every time a new top-level window is added. xprop is
-    # provided by x11-utils, but keep the poll loop alive even if it is absent
-    # or exits early in a minimal desktop session.
+    # Wine starts explorer.exe before/around KakaoTalk.exe. Hide during the
+    # startup grace period too; otherwise the 160x20 tray strip can remain
+    # visible until KakaoTalk.exe appears and the normal watcher begins.
     seen_kakao=0
     startup_waits=0
     while [ "$startup_waits" -lt 80 ]; do
+        hide_all
         if pgrep -x KakaoTalk.exe >/dev/null 2>&1; then
             seen_kakao=1
             break
         fi
         startup_waits=$((startup_waits + 1))
-        sleep 0.25
+        sleep 0.1
     done
     [ "$seen_kakao" -eq 1 ] || exit 0
 
+    # Event stream: fires every time a new top-level window is added. xprop is
+    # provided by x11-utils, but keep the poll loop alive even if it is absent
+    # or exits early in a minimal desktop session.
     if command -v xprop >/dev/null 2>&1; then
         (
             xprop -spy -root _NET_CLIENT_LIST 2>/dev/null | while read -r _; do
