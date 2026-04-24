@@ -6,6 +6,8 @@ export WINEARCH=win32
 export WINEPREFIX="$HOME/.wine_kakao"
 export WINEDEBUG=-all
 APP_DIR="$WINEPREFIX/drive_c/Program Files/Kakao/KakaoTalk"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+HIDER_PID_FILE="$RUNTIME_DIR/kakaotalk-wine-tray-hider.pid"
 
 die() {
     printf 'kakaotalk: %s\n' "$*" >&2
@@ -20,8 +22,19 @@ stop_kakao() {
     # Scope shutdown to this Wine prefix instead of killing every explorer.exe
     # owned by the user; other Wine applications may have their own tray hosts.
     need_cmd wineserver
+    stop_hider
     WINEPREFIX="$WINEPREFIX" wineserver -k >/dev/null 2>&1 || true
     sleep 1
+}
+
+stop_hider() {
+    if [ -f "$HIDER_PID_FILE" ]; then
+        hider_pid=$(cat "$HIDER_PID_FILE" 2>/dev/null || true)
+        if [ -n "${hider_pid:-}" ] && kill -0 "$hider_pid" 2>/dev/null; then
+            kill "$hider_pid" 2>/dev/null || true
+        fi
+        rm -f "$HIDER_PID_FILE"
+    fi
 }
 
 # --quit: terminate KakaoTalk and clean up the Wine explorer.exe tray host
@@ -32,7 +45,7 @@ fi
 
 [ -n "${DISPLAY:-}" ] || die "requires an X11/Xwayland DISPLAY; start it from a graphical Ubuntu session."
 
-for cmd in wine wineserver pgrep xdotool xwininfo; do
+for cmd in wine wineserver pgrep xdotool xwininfo wmctrl; do
     need_cmd "$cmd"
 done
 
@@ -40,6 +53,81 @@ done
 
 is_kakao_running() {
     pgrep -x KakaoTalk.exe >/dev/null 2>&1
+}
+
+main_window_id() {
+    wmctrl -lx | awk '$3 == "kakaotalk.exe.kakaotalk.exe" {print $1; exit}'
+}
+
+focus_window() {
+    wmctrl -ia "$1" 2>/dev/null || xdotool windowactivate "$1" 2>/dev/null || true
+    xdotool windowraise "$1" 2>/dev/null || true
+}
+
+start_hider() {
+    stop_hider
+    DISPLAY="$DISPLAY" WINEPREFIX="$WINEPREFIX" nohup bash -c '
+        export DISPLAY WINEPREFIX
+
+        hide_all() {
+            ids="$(
+                {
+                    xdotool search --class "explorer.exe" 2>/dev/null
+                    xdotool search --class "kakaotalk.exe" 2>/dev/null
+                } | sort -u
+            )"
+            for wid in $ids; do
+                state=$(xwininfo -id "$wid" 2>/dev/null | awk "/Map State/ {print \$3}")
+                [ "$state" = "IsViewable" ] || continue
+
+                unset WIDTH HEIGHT
+                eval "$(xdotool getwindowgeometry --shell "$wid" 2>/dev/null)" || continue
+                [ "${WIDTH:-9999}" -le 320 ] && [ "${HEIGHT:-9999}" -le 120 ] || continue
+
+                # Hide Wine tray/IME/helper strips, but never hide the real
+                # KakaoTalk main window if it happens to be small on a scaled
+                # display.
+                props=$(xprop -id "$wid" WM_CLASS _NET_WM_NAME WM_NAME 2>/dev/null || true)
+                case "$props" in
+                    *"kakaotalk.exe"*"카카오톡"*)
+                        continue
+                        ;;
+                esac
+
+                xdotool windowunmap "$wid" 2>/dev/null || true
+            done
+        }
+
+        if command -v xprop >/dev/null 2>&1; then
+            (
+                xprop -spy -root _NET_CLIENT_LIST 2>/dev/null | while read -r _; do
+                    hide_all
+                done
+            ) &
+            EVENT_PID=$!
+        fi
+
+        cleanup() {
+            [ -z "${EVENT_PID:-}" ] || kill "$EVENT_PID" 2>/dev/null || true
+        }
+        trap cleanup EXIT
+
+        # Keep hiding while KakaoTalk or Wine explorer exists. The extra idle
+        # grace covers restart gaps and the user pressing X, where explorer.exe
+        # can map a yellow 160x20 tray strip after the main window disappears.
+        idle_ticks=0
+        while [ "$idle_ticks" -lt 25 ]; do
+            hide_all
+            if pgrep -x KakaoTalk.exe >/dev/null 2>&1 ||
+                pgrep -x explorer.exe >/dev/null 2>&1; then
+                idle_ticks=0
+            else
+                idle_ticks=$((idle_ticks + 1))
+            fi
+            sleep 0.2
+        done
+    ' >/dev/null 2>&1 &
+    echo "$!" >"$HIDER_PID_FILE"
 }
 
 # --restart: kill any running instance and start fresh (fixes black-screen)
@@ -54,16 +142,14 @@ fi
 #     cleanly from an external windowmap, so do a full restart instead of
 #     showing a black window. Login data is preserved in the prefix.
 if is_kakao_running; then
-    wid=$(xdotool search --name "카카오톡" 2>/dev/null | head -1)
+    wid=$(main_window_id)
     if [ -n "$wid" ]; then
-        state=$(xwininfo -id "$wid" 2>/dev/null | awk '/Map State/ {print $3}')
-        if [ "$state" = "IsViewable" ]; then
-            xdotool windowactivate "$wid" 2>/dev/null
-            xdotool windowraise "$wid" 2>/dev/null
-            exit 0
-        fi
+        start_hider
+        focus_window "$wid"
+        exit 0
     fi
-    # Hidden (or window missing) → force a clean restart.
+    # Hidden to tray (or window missing) → force a clean restart. Trying to map
+    # the old Wine window often repaints as a black/yellow broken surface.
     stop_kakao
     sleep 1
 fi
@@ -75,59 +161,6 @@ setsid -f bash -c '
         wine KakaoTalk.exe
 ' </dev/null >/dev/null 2>&1
 
-# Watcher in its own session: unmap the Wine explorer.exe tray strip whenever it appears.
-# Event-driven via `xprop -spy` on _NET_CLIENT_LIST so we react within a frame
-# instead of waiting out a poll interval (the strip used to flash visibly for
-# up to 1s at startup). A 0.5s safety-net poll catches anything xprop misses.
-setsid -f bash -c '
-    export DISPLAY="'"$DISPLAY"'"
-    export WINEPREFIX="$HOME/.wine_kakao"
-    hide_all() {
-        for wid in $(xdotool search --class "explorer.exe" 2>/dev/null); do
-            state=$(xwininfo -id "$wid" 2>/dev/null | awk "/Map State/ {print \$3}")
-            [ "$state" = "IsViewable" ] || continue
-            # The Wine tray host is a tiny strip. Avoid unmapping real windows
-            # from unrelated Wine applications that also use explorer.exe.
-            eval "$(xdotool getwindowgeometry --shell "$wid" 2>/dev/null)"
-            if [ "${WIDTH:-9999}" -le 320 ] && [ "${HEIGHT:-9999}" -le 120 ]; then
-                xdotool windowunmap "$wid" 2>/dev/null
-            fi
-        done
-    }
-    # Wine starts explorer.exe before/around KakaoTalk.exe. Hide during the
-    # startup grace period too; otherwise the 160x20 tray strip can remain
-    # visible until KakaoTalk.exe appears and the normal watcher begins.
-    seen_kakao=0
-    startup_waits=0
-    while [ "$startup_waits" -lt 80 ]; do
-        hide_all
-        if pgrep -x KakaoTalk.exe >/dev/null 2>&1; then
-            seen_kakao=1
-            break
-        fi
-        startup_waits=$((startup_waits + 1))
-        sleep 0.1
-    done
-    [ "$seen_kakao" -eq 1 ] || exit 0
-
-    # Event stream: fires every time a new top-level window is added. xprop is
-    # provided by x11-utils, but keep the poll loop alive even if it is absent
-    # or exits early in a minimal desktop session.
-    if command -v xprop >/dev/null 2>&1; then
-        (
-            xprop -spy -root _NET_CLIENT_LIST 2>/dev/null | while read -r _; do
-                pgrep -x KakaoTalk.exe >/dev/null 2>&1 || break
-                hide_all
-            done
-        ) &
-        EVENT_PID=$!
-    fi
-    while pgrep -x KakaoTalk.exe >/dev/null 2>&1; do
-        hide_all
-        sleep 0.5
-    done
-    [ -z "${EVENT_PID:-}" ] || kill "$EVENT_PID" 2>/dev/null
-    wineserver -k >/dev/null 2>&1 || true
-' </dev/null >/dev/null 2>&1
+start_hider
 
 exit 0
