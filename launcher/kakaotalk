@@ -1,0 +1,72 @@
+#!/bin/bash
+# KakaoTalk launcher: runs under Wine, auto-hides the explorer.exe tray strip,
+# and re-focuses an existing instance instead of starting a second one.
+
+export WINEARCH=win32
+export WINEPREFIX="$HOME/.wine_kakao"
+export WINEDEBUG=-all
+export DISPLAY="${DISPLAY:-:1}"
+
+# --quit: terminate KakaoTalk and clean up the Wine explorer.exe tray host
+if [ "$1" = "--quit" ] || [ "$1" = "-q" ]; then
+    pkill -x KakaoTalk.exe 2>/dev/null
+    sleep 2
+    pkill -KILL -x KakaoTalk.exe 2>/dev/null
+    pkill -x explorer.exe 2>/dev/null
+    exit 0
+fi
+
+# --restart: kill any running instance and start fresh (fixes black-screen)
+if [ "$1" = "--restart" ] || [ "$1" = "-r" ]; then
+    pkill -x KakaoTalk.exe 2>/dev/null
+    sleep 2
+    pkill -KILL -x KakaoTalk.exe 2>/dev/null
+    pkill -x explorer.exe 2>/dev/null
+    sleep 1
+fi
+
+# If KakaoTalk is already running:
+#   - Main window is still viewable → just focus it.
+#   - Main window was hidden to tray (X button) → Wine/KakaoTalk can't repaint
+#     cleanly from an external windowmap, so do a full restart instead of
+#     showing a black window. Login data is preserved in the prefix.
+if pgrep -x KakaoTalk.exe >/dev/null 2>&1; then
+    wid=$(xdotool search --name "카카오톡" 2>/dev/null | head -1)
+    if [ -n "$wid" ]; then
+        state=$(xwininfo -id "$wid" 2>/dev/null | awk '/Map State/ {print $3}')
+        if [ "$state" = "IsViewable" ]; then
+            xdotool windowactivate "$wid" 2>/dev/null
+            xdotool windowraise "$wid" 2>/dev/null
+            exit 0
+        fi
+    fi
+    # Hidden (or window missing) → force a clean restart.
+    pkill -x KakaoTalk.exe 2>/dev/null
+    sleep 2
+    pkill -KILL -x KakaoTalk.exe 2>/dev/null
+    pkill -x explorer.exe 2>/dev/null
+    sleep 1
+fi
+
+# Launch KakaoTalk detached via setsid.
+setsid -f bash -c '
+    cd "$HOME/.wine_kakao/drive_c/Program Files/Kakao/KakaoTalk" || exit 1
+    WINEARCH=win32 WINEPREFIX="$HOME/.wine_kakao" WINEDEBUG=-all DISPLAY="'"$DISPLAY"'" \
+        wine KakaoTalk.exe
+' </dev/null >/dev/null 2>&1
+
+# Watcher in its own session: unmap the Wine explorer.exe tray strip whenever it appears.
+setsid -f bash -c '
+    export DISPLAY="'"$DISPLAY"'"
+    sleep 2
+    while pgrep -x KakaoTalk.exe >/dev/null 2>&1; do
+        for wid in $(xdotool search --class "explorer.exe" 2>/dev/null); do
+            state=$(xwininfo -id "$wid" 2>/dev/null | awk "/Map State/ {print \$3}")
+            [ "$state" = "IsViewable" ] && xdotool windowunmap "$wid" 2>/dev/null
+        done
+        sleep 1
+    done
+    pkill -x explorer.exe 2>/dev/null
+' </dev/null >/dev/null 2>&1
+
+exit 0
