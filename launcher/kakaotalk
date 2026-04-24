@@ -5,23 +5,46 @@
 export WINEARCH=win32
 export WINEPREFIX="$HOME/.wine_kakao"
 export WINEDEBUG=-all
-export DISPLAY="${DISPLAY:-:1}"
+APP_DIR="$WINEPREFIX/drive_c/Program Files/Kakao/KakaoTalk"
+
+die() {
+    printf 'kakaotalk: %s\n' "$*" >&2
+    exit 1
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "missing required command '$1'; rerun install.sh to install dependencies."
+}
+
+stop_kakao() {
+    # Scope shutdown to this Wine prefix instead of killing every explorer.exe
+    # owned by the user; other Wine applications may have their own tray hosts.
+    need_cmd wineserver
+    WINEPREFIX="$WINEPREFIX" wineserver -k >/dev/null 2>&1 || true
+    sleep 1
+}
 
 # --quit: terminate KakaoTalk and clean up the Wine explorer.exe tray host
-if [ "$1" = "--quit" ] || [ "$1" = "-q" ]; then
-    pkill -x KakaoTalk.exe 2>/dev/null
-    sleep 2
-    pkill -KILL -x KakaoTalk.exe 2>/dev/null
-    pkill -x explorer.exe 2>/dev/null
+if [ "${1:-}" = "--quit" ] || [ "${1:-}" = "-q" ]; then
+    stop_kakao
     exit 0
 fi
 
+[ -n "${DISPLAY:-}" ] || die "requires an X11/Xwayland DISPLAY; start it from a graphical Ubuntu session."
+
+for cmd in wine wineserver pgrep xdotool xwininfo; do
+    need_cmd "$cmd"
+done
+
+[ -d "$APP_DIR" ] || die "KakaoTalk is not installed at $APP_DIR; rerun install.sh."
+
+is_kakao_running() {
+    pgrep -x KakaoTalk.exe >/dev/null 2>&1
+}
+
 # --restart: kill any running instance and start fresh (fixes black-screen)
-if [ "$1" = "--restart" ] || [ "$1" = "-r" ]; then
-    pkill -x KakaoTalk.exe 2>/dev/null
-    sleep 2
-    pkill -KILL -x KakaoTalk.exe 2>/dev/null
-    pkill -x explorer.exe 2>/dev/null
+if [ "${1:-}" = "--restart" ] || [ "${1:-}" = "-r" ]; then
+    stop_kakao
     sleep 1
 fi
 
@@ -30,7 +53,7 @@ fi
 #   - Main window was hidden to tray (X button) → Wine/KakaoTalk can't repaint
 #     cleanly from an external windowmap, so do a full restart instead of
 #     showing a black window. Login data is preserved in the prefix.
-if pgrep -x KakaoTalk.exe >/dev/null 2>&1; then
+if is_kakao_running; then
     wid=$(xdotool search --name "카카오톡" 2>/dev/null | head -1)
     if [ -n "$wid" ]; then
         state=$(xwininfo -id "$wid" 2>/dev/null | awk '/Map State/ {print $3}')
@@ -41,10 +64,7 @@ if pgrep -x KakaoTalk.exe >/dev/null 2>&1; then
         fi
     fi
     # Hidden (or window missing) → force a clean restart.
-    pkill -x KakaoTalk.exe 2>/dev/null
-    sleep 2
-    pkill -KILL -x KakaoTalk.exe 2>/dev/null
-    pkill -x explorer.exe 2>/dev/null
+    stop_kakao
     sleep 1
 fi
 
@@ -61,27 +81,49 @@ setsid -f bash -c '
 # up to 1s at startup). A 0.5s safety-net poll catches anything xprop misses.
 setsid -f bash -c '
     export DISPLAY="'"$DISPLAY"'"
+    export WINEPREFIX="$HOME/.wine_kakao"
     hide_all() {
         for wid in $(xdotool search --class "explorer.exe" 2>/dev/null); do
             state=$(xwininfo -id "$wid" 2>/dev/null | awk "/Map State/ {print \$3}")
-            [ "$state" = "IsViewable" ] && xdotool windowunmap "$wid" 2>/dev/null
+            [ "$state" = "IsViewable" ] || continue
+            # The Wine tray host is a tiny strip. Avoid unmapping real windows
+            # from unrelated Wine applications that also use explorer.exe.
+            eval "$(xdotool getwindowgeometry --shell "$wid" 2>/dev/null)"
+            if [ "${WIDTH:-9999}" -le 320 ] && [ "${HEIGHT:-9999}" -le 120 ]; then
+                xdotool windowunmap "$wid" 2>/dev/null
+            fi
         done
     }
-    # Fallback poll loop — 0.5s cadence.
-    (
-        while pgrep -x KakaoTalk.exe >/dev/null 2>&1; do
-            hide_all
-            sleep 0.5
-        done
-    ) &
-    POLL_PID=$!
-    # Event stream: fires every time a new top-level window is added.
-    xprop -spy -root _NET_CLIENT_LIST 2>/dev/null | while read -r _; do
-        pgrep -x KakaoTalk.exe >/dev/null 2>&1 || break
-        hide_all
+    # Event stream: fires every time a new top-level window is added. xprop is
+    # provided by x11-utils, but keep the poll loop alive even if it is absent
+    # or exits early in a minimal desktop session.
+    seen_kakao=0
+    startup_waits=0
+    while [ "$startup_waits" -lt 80 ]; do
+        if pgrep -x KakaoTalk.exe >/dev/null 2>&1; then
+            seen_kakao=1
+            break
+        fi
+        startup_waits=$((startup_waits + 1))
+        sleep 0.25
     done
-    kill "$POLL_PID" 2>/dev/null
-    pkill -x explorer.exe 2>/dev/null
+    [ "$seen_kakao" -eq 1 ] || exit 0
+
+    if command -v xprop >/dev/null 2>&1; then
+        (
+            xprop -spy -root _NET_CLIENT_LIST 2>/dev/null | while read -r _; do
+                pgrep -x KakaoTalk.exe >/dev/null 2>&1 || break
+                hide_all
+            done
+        ) &
+        EVENT_PID=$!
+    fi
+    while pgrep -x KakaoTalk.exe >/dev/null 2>&1; do
+        hide_all
+        sleep 0.5
+    done
+    [ -z "${EVENT_PID:-}" ] || kill "$EVENT_PID" 2>/dev/null
+    wineserver -k >/dev/null 2>&1 || true
 ' </dev/null >/dev/null 2>&1
 
 exit 0
