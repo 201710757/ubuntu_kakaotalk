@@ -56,15 +56,16 @@ setsid -f bash -c '
 ' </dev/null >/dev/null 2>&1
 
 # Watcher in its own session: unmap the Wine explorer.exe tray strip whenever it appears.
+# Poll fast (0.2s) so a newly-mapped strip never flashes on screen long enough to notice.
 setsid -f bash -c '
     export DISPLAY="'"$DISPLAY"'"
-    sleep 2
+    sleep 1
     while pgrep -x KakaoTalk.exe >/dev/null 2>&1; do
         for wid in $(xdotool search --class "explorer.exe" 2>/dev/null); do
             state=$(xwininfo -id "$wid" 2>/dev/null | awk "/Map State/ {print \$3}")
             [ "$state" = "IsViewable" ] && xdotool windowunmap "$wid" 2>/dev/null
         done
-        sleep 1
+        sleep 0.2
     done
     pkill -x explorer.exe 2>/dev/null
 ' </dev/null >/dev/null 2>&1
